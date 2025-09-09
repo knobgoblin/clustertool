@@ -1,0 +1,223 @@
+#!/bin/zsh
+
+. $HOME/bin/formatting.sh
+
+me=$(basename $0)
+
+usage() {
+  echo
+  echo "USAGE"
+  echo "    $me <cluster name> <verb> dev|prod"
+  echo
+  exit 1
+}
+
+get_account() {
+  local env=$1
+  aws_account=INVALID
+  for account in $(crudini --get $config accounts)
+  do
+    if [ $account != default ]
+    then
+      for eks_env in $(crudini --get $config accounts $account)
+      do
+        if [ $env = $eks_env ]
+        then
+          aws_account=$account
+        fi
+      done
+    fi
+  done
+  echo $aws_account
+}
+
+use() {
+  eks_cluster=false
+  region=$(crudini --get $config region)
+  account=$(get_account $env)
+  if [ $account = INVALID ]
+  then
+    echo_error "No account found for environment $env"
+    exit 1
+  fi
+  echo_debug "Using account $account for environment $env"
+  for suffix in $(crudini --get $config suffixes)
+  do
+    eks_context=arn:aws:eks:${region}:${account}:cluster/${cluster}-${suffix}
+    echo_debug "Checking for EKS context $eks_context ..."
+    if (grep "cluster:\ $eks_context" $HOME/.kube/config > /dev/null 2>&1)
+    then
+      eks_cluster=true
+    fi
+  done
+  
+  echo
+  echo -n "Switching to cluster "
+  echo_coloured_nolf BLUE $cluster
+  if [ $eks_cluster = true ]
+  then
+    echo -n " in account "
+    echo_coloured_nolf BLUE $account
+    echo -n " ("
+    echo_coloured_nolf BLUE $env
+    echo -n ") ... "
+  else
+    echo -n " ("
+    echo_coloured_nolf BLUE non-EKS
+    echo -n ") ... "
+  fi
+
+  if [ $eks_cluster = false ]
+  then
+    context=$cluster
+  else
+    context=$eks_context
+  fi
+
+  kubectl config use-context $context > /dev/null 2>/var/tmp/cluster-error.txt
+
+  if [ $? = 0 ]
+  then
+    print_success
+    echo
+  else
+    print_failure
+    if [ -f $error_capture ]
+    then
+      echo
+      CLUSTER_ERROR=$(cat $error_capture)
+      echo_coloured_nolf RED "ERROR: "
+      echo $CLUSTER_ERROR
+      echo
+      rm -f $error_capture
+    fi
+  fi
+}
+
+show() {
+  account=$(kubectl config get-contexts | grep ^\* | awk '{ print $2 }' | cut -d: -f5)
+  cluster=$(kubectl config get-contexts | grep ^\* | awk '{ print $2 }' | cut -d/ -f2)
+  namespace=$(kubectl config get-contexts | grep ^\* | awk '{ print $5 }')
+  if [ -z $namespace ]
+  then
+    namespace=default
+  fi
+  echo
+  echo -n "Cluster "
+  echo_coloured_nolf BLUE $cluster
+  echo -n ", account "
+  echo_coloured_nolf BLUE $account
+  echo -n ", namespace "
+  echo_coloured BLUE $namespace
+  echo
+}
+
+list() {
+  region=$(crudini --get $config region)
+  echo_debug "Region      : '$region'"
+  echo
+  echo "Available clusters:"
+  echo
+  grep 'cluster: ' $HOME/.kube/config | awk '{ print $2 }' | while read line
+  do
+    eks_expression=^arn:aws:eks:${region}:
+    if [[ $line =~ $eks_expression ]]
+    then
+      echo_debug "Matched, line '$line'"
+      cluster_name=$(echo $line | cut -d/ -f2)
+      account=$(echo $line | cut -d: -f5)
+      env=$(crudini --get $config accounts $account 2>&1)
+      if [ $? != 0 ]
+      then
+        env=undefined
+      fi
+    else
+      cluster_name=$line
+      account=non-EKS
+      env=none
+    fi
+    echo_debug "Line        : '$line'"
+    echo_debug "Cluster name: '$cluster_name'"
+    echo_debug "Account     : '$account'"
+    echo_debug "Environment : '$env'"
+    for suffix in $(crudini --get $config suffixes)
+    do
+      pattern=arn:aws:eks:${region}:${account}:cluster/.*-$suffix$
+      if [[ $line =~ $pattern ]]
+      then
+        if [ $env = INVALID ]
+        then
+          env=undefined
+        fi
+      fi
+      expression=-$suffix$
+      short_name=$(echo $cluster_name | sed "s/$expression//")
+    done
+    echo -n "   "
+    echo_coloured_nolf BLUE $line
+    echo_coloured_nolf DKGRAY " Cluster name: "
+    echo_coloured_nolf BLUE "$short_name "
+    echo_coloured_nolf DKGRAY "Environment(s): "
+    if [ $env = none ]
+    then
+      echo_coloured GREEN none
+    elif [ $env = undefined ]
+    then
+      echo_coloured RED undefined
+    else
+      env=$(echo $env | tr ' ' ',')
+      echo_coloured BLUE $env
+    fi
+  done
+  echo
+  echo -n "Default environment is '"
+  echo_coloured_nolf BLUE $default_env
+  echo "'."
+  echo
+}
+
+if [[ $# < 1 ]]
+then
+  usage
+fi
+
+verb=$1
+cluster=$2
+env=$3
+
+config=$HOME/etc/cluster.conf
+if [ ! -f $config ]
+then
+  echo_error "Configuration file $config not found"
+  exit 1
+fi
+default_env=$(crudini --get $config accounts default 2>&1)
+echo_debug "Default environment is '$default_env'"
+if [ $? != 0 ]
+then
+  echo "No default environment set in $config"
+  exit 1
+fi
+
+error_capture=/var/tmp/cluster-error.txt
+
+if [ -z $env ]
+then
+  env=$default_env
+fi
+
+case $verb in
+  use)
+    use
+    ;;
+  show)
+    show
+    ;;
+  list)
+    list
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
